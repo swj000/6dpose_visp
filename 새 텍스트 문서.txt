@@ -1,0 +1,151 @@
+#include <visp3/core/vpCameraParameters.h>
+#include <visp3/core/vpHomogeneousMatrix.h>
+#include <visp3/core/vpImage.h>
+#include <visp3/core/vpPoint.h>
+#include <visp3/gui/vpDisplayGDI.h>
+#include <visp3/io/vpImageIo.h>
+#include <visp3/vision/vpPose.h>
+#include <visp3/core/vpMeterPixelConversion.h>
+#include <opencv2/opencv.hpp>
+#include <visp3/gui/vpDisplayOpenCV.h>
+
+void computePose(std::vector<vpPoint>& point, const std::vector<vpImagePoint>& ip, const vpCameraParameters& cam, bool init, vpHomogeneousMatrix& cMo)
+{
+    vpPose pose;
+    double x = 0, y = 0;
+    for (unsigned int i = 0; i < point.size(); i++) {
+        vpPixelMeterConversion::convertPoint(cam, ip[i], x, y);
+        point[i].set_x(x);
+        point[i].set_y(y);
+        pose.addPoint(point[i]);
+    }
+
+    if (init == true) {
+        pose.computePose(vpPose::DEMENTHON_LAGRANGE_VIRTUAL_VS, cMo);
+    }
+    else {
+        pose.computePose(vpPose::VIRTUAL_VS, cMo);
+    }
+}
+
+int main()
+{
+    try {
+        // 이미지 불러오기
+        cv::Mat img = cv::imread("C:/Users/VDSL/Desktop/pose_visp/images/002_C_01.bmp", cv::IMREAD_GRAYSCALE);
+        if (img.empty()) {
+            throw std::runtime_error("Wrong Image Path");
+        }
+        vpImage<unsigned char> I(img.rows, img.cols);
+        memcpy(I.bitmap, img.data, img.rows * img.cols);
+
+        // 디스플레이 설정 / vp디폴트 작동 X -> 우선 openCV 사용해서 구현
+        vpDisplayOpenCV d(I, 100, 100, "ViSP OpenCV Display");
+        //vpDisplayOpenCV d(I, "ViSP OpenCV Display");
+
+        vpDisplay::display(I);
+
+        // 카메라 내부 파라미터 (pixel)
+        double fx = 6187.0, fy = 6187.0;
+        double cx = 1024.0, cy = 768.0;
+        vpCameraParameters cam(fx, fy, cx, cy);
+
+        // QR 코드 실제 크기 (mm)
+        float qr_size = 28.0f;
+
+        // 3D QR코드의 world 좌표 (Z=0 평면 위, mm 단위)
+        std::vector<vpPoint> object_points = {
+            vpPoint(0, 0, 0),
+            vpPoint(0, qr_size, 0),
+            vpPoint(qr_size, qr_size, 0),
+            vpPoint(qr_size, 0, 0)
+        };
+
+        // 2D 이미지 plane 좌표 (픽셀 기준, y,x 순서)
+        std::vector<vpImagePoint> image_points = {
+            vpImagePoint(344.5, 286),
+            vpImagePoint(399, 287),
+            vpImagePoint(398.5, 341.5),
+            vpImagePoint(343.5, 341)
+        };
+
+        // VISP 공홈에 있는 예제 코드 참고
+        vpHomogeneousMatrix cMo;
+
+        bool init = true;
+        computePose(object_points, image_points, cam, init, cMo);
+
+        // 중심점 및 축 표시용 / cMo의 경우 4x4, oP의 경우 3x1 벡터 -> 동차 좌표로 변환
+        vpPoint center(qr_size / 2, qr_size / 2, 0);
+        vpColVector oP(4);
+        oP[0] = center.get_oX();
+        oP[1] = center.get_oY();
+        oP[2] = center.get_oZ();
+        oP[3] = 1.0; // 동차 좌표 1 붙이기
+
+
+        vpColVector cP_ = cMo * oP;
+        vpColVector cP(3);
+
+        cP[0] = cP_[0];
+        cP[1] = cP_[1];
+        cP[2] = cP_[2];
+        // cP[3]는 동차 좌표의 1이므로 무시
+
+        vpImagePoint proj_center;
+        //vpPixelMeterConversion::convertPoint(cam, cMo * center, proj_center);
+        //vpMeterPixelConversion::convertPoint(cam, cP[0], cP[1], cP[2], proj_center);
+        vpMeterPixelConversion::convertPoint(cam, cP[0], cP[1], proj_center);
+
+        std::cout << "[INFO] Projected QR center: (v = " << proj_center.get_v() << ", u = " << proj_center.get_u() << ")" << std::endl;
+
+        vpDisplay::displayCross(I, proj_center, 10, vpColor::red);
+
+        for (const auto& pt : image_points) {
+            vpDisplay::displayCross(I, pt, 7, vpColor::red);
+        }
+
+        vpPoint center_qr(qr_size / 2, qr_size / 2, 0); // QR 중심 (모델 좌표계 기준)
+
+        vpColVector oP_center(4);
+        oP_center[0] = center_qr.get_oX();
+        oP_center[1] = center_qr.get_oY();
+        oP_center[2] = center_qr.get_oZ();
+        oP_center[3] = 1.0;
+
+        vpColVector cP_center = cMo * oP_center;
+
+        vpHomogeneousMatrix cM_center;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                cM_center[i][j] = cMo[i][j]; // 회전행렬 복사
+
+        cM_center[0][3] = cP_center[0]; // 중심점 위치로 이동
+        cM_center[1][3] = cP_center[1];
+        cM_center[2][3] = cP_center[2];
+
+        // 좌표축 표시
+        vpDisplay::displayFrame(I, cM_center, cam, 4, vpColor::none, 2);
+
+        // 결과 출력
+        vpTranslationVector t = cMo.getTranslationVector();
+        vpRotationMatrix R = cMo.getRotationMatrix();
+        vpRxyzVector euler(R); // roll-pitch-yaw, radian
+        euler[0] *= (180.0 / M_PI);
+        euler[1] *= (180.0 / M_PI);
+        euler[2] *= (180.0 / M_PI);
+
+        std::cout << "\nTranslation vector (mm):\n" << t.t() << std::endl;
+        std::cout << "\nRotation matrix:\n" << R << std::endl;
+        std::cout << "\nEuler angles (degrees):\n" << euler.t() << std::endl;
+
+        vpDisplay::displayText(I, static_cast<int>(I.getHeight()) - 15, 10, "A click to quit...", vpColor::red);
+        vpDisplay::flush(I);
+        vpDisplay::getClick(I);
+    }
+    catch (const vpException& e) {
+        std::cerr << "ViSP Error: " << e.getMessage() << std::endl;
+    }
+
+    return 0;
+}
